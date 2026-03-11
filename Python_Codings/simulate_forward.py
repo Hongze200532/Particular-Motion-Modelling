@@ -11,6 +11,7 @@ Frame origin is at the CENTER of the pixel frame.
 Output folder:
 Outputs_simulate/
 """
+
 """
 Forward Simulator
 =================
@@ -217,7 +218,10 @@ class SimConfig:
     particle_noise_sigma: float = 5e-4
     dye_kappa: float = 0.0
 
+    # keep for backward compatibility; when False, y random walk/respawn is skipped
     enable_out_of_plane: bool = True
+    enable_sheet_gating: bool = True
+    sheet_center_y: float = 0.0
     sheet_thickness: float = 0.02
     y_noise_sigma: float = 0.005
     y_kill: float = 0.06
@@ -296,14 +300,84 @@ def advect_particles_rk2(x, z, t, dt, cfg):
     return x_new,z_new
 
 
-def update_out_of_plane(y,dt,cfg):
+def bilinear_sample(field, xq, zq, xs, zs, periodic_x=True):
+
+    Nz, Nx = field.shape
+    dx = xs[1] - xs[0]
+    dz = zs[1] - zs[0]
+
+    if periodic_x:
+        xq = wrap_x_centered(xq, xs[-1] - xs[0] + dx)
+
+    ix = (xq - xs[0]) / dx
+    iz = (zq - zs[0]) / dz
+
+    if periodic_x:
+        ix = np.mod(ix, Nx)
+    else:
+        ix = np.clip(ix, 0, Nx - 1 - 1e-6)
+    iz = np.clip(iz, 0, Nz - 1 - 1e-6)
+
+    i0 = np.floor(ix).astype(int)
+    j0 = np.floor(iz).astype(int)
+    i1 = (i0 + 1) % Nx if periodic_x else np.minimum(i0 + 1, Nx - 1)
+    j1 = np.minimum(j0 + 1, Nz - 1)
+
+    tx = ix - i0
+    tz = iz - j0
+
+    f00 = field[j0, i0]
+    f10 = field[j0, i1]
+    f01 = field[j1, i0]
+    f11 = field[j1, i1]
+
+    return (1 - tx) * (1 - tz) * f00 + tx * (1 - tz) * f10 + (1 - tx) * tz * f01 + tx * tz * f11
+
+
+def advect_dye_semilag(c, xs, zs, t, dt, cfg):
+
+    X, Z = np.meshgrid(xs, zs)
+    u, w = vel_u_w(X, Z, t, cfg.A, cfg.k, cfg.gamma)
+
+    Xb = X - u * dt
+    Zb = Z - w * dt
+
+    c_new = bilinear_sample(c, Xb, Zb, xs, zs, periodic_x=True)
+
+    if cfg.dye_kappa > 0:
+        c_pad = np.pad(c_new, ((1, 1), (0, 0)), mode="edge")
+        c_up = c_pad[0:-2, :]
+        c_dn = c_pad[2:, :]
+        c_lt = np.roll(c_new, 1, axis=1)
+        c_rt = np.roll(c_new, -1, axis=1)
+        dx = xs[1] - xs[0]
+        dz = zs[1] - zs[0]
+        lap = (c_lt - 2 * c_new + c_rt) / dx**2 + (c_up - 2 * c_new + c_dn) / dz**2
+        c_new = np.clip(c_new + dt * cfg.dye_kappa * lap, 0.0, None)
+
+    return c_new
+
+
+def update_y_depth(y,dt,cfg):
 
     return y + np.random.normal(0,cfg.y_noise_sigma*np.sqrt(dt),size=y.shape)
 
 
+def update_out_of_plane(y,dt,cfg):
+
+    return update_y_depth(y,dt,cfg)
+
+
+def visible_mask_y(y,cfg):
+
+    if not cfg.enable_sheet_gating:
+        return np.ones_like(y,dtype=bool)
+    return np.abs(y - cfg.sheet_center_y) <= 0.5*cfg.sheet_thickness
+
+
 def visible_mask(y,cfg):
 
-    return np.abs(y) <= 0.5*cfg.sheet_thickness
+    return visible_mask_y(y,cfg)
 
 
 def respawn(mask,state,cfg):
@@ -319,8 +393,8 @@ def respawn(mask,state,cfg):
     state.zp[idx] = np.clip(zp_new,cfg.zmin,cfg.zmax)
 
     state.y[idx] = np.random.uniform(
-        -0.25*cfg.sheet_thickness,
-        0.25*cfg.sheet_thickness,
+        cfg.sheet_center_y - 0.25*cfg.sheet_thickness,
+        cfg.sheet_center_y + 0.25*cfg.sheet_thickness,
         idx.size
     )
 
@@ -333,18 +407,16 @@ def step_evolution(state,xs,zs,t,cfg):
         state.xp,state.zp,t,cfg.dt,cfg
     )
 
+    state.c = advect_dye_semilag(state.c,xs,zs,t,cfg.dt,cfg)
+
     if cfg.enable_out_of_plane:
 
-        state.y = update_out_of_plane(state.y,cfg.dt,cfg)
+        state.y = update_y_depth(state.y,cfg.dt,cfg)
 
-        kill = np.abs(state.y) > cfg.y_kill
+        kill = np.abs(state.y - cfg.sheet_center_y) > cfg.y_kill
         state = respawn(kill,state,cfg)
-
-        vis = visible_mask(state.y,cfg)
-
-    else:
-
-        vis = np.ones(cfg.N,dtype=bool)
+    
+    vis = visible_mask_y(state.y,cfg)
 
     return state,vis
 
@@ -462,8 +534,8 @@ def init_state(cfg):
     zp = np.clip(zp,cfg.zmin,cfg.zmax)
 
     y = np.random.uniform(
-        -0.25*cfg.sheet_thickness,
-        0.25*cfg.sheet_thickness,
+        cfg.sheet_center_y - 0.25*cfg.sheet_thickness,
+        cfg.sheet_center_y + 0.25*cfg.sheet_thickness,
         cfg.N
     )
 

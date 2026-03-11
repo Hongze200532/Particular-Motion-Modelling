@@ -73,7 +73,7 @@ class State:
 
 
 # =========================================================
-# Coordinate helpers (NEW): centered periodic wrap in x
+# Coordinate centered periodic wrap in x
 # =========================================================
 
 def wrap_x_centered(x: np.ndarray, Lx: float) -> np.ndarray:
@@ -84,7 +84,7 @@ def wrap_x_centered(x: np.ndarray, Lx: float) -> np.ndarray:
 
 
 # =========================================================
-# Velocity field on x–z slice (placeholder; unchanged)
+# Velocity field on x–z slice 
 # =========================================================
 
 def vel_u_w(x, z, t, A, k, gamma):
@@ -101,7 +101,7 @@ def vel_u_w(x, z, t, A, k, gamma):
 
 
 # =========================================================
-# Core numerical helpers
+# Numerical advection and evolution steps
 # =========================================================
 
 def advect_particles_rk2(x, z, t, dt, cfg: SimConfig):
