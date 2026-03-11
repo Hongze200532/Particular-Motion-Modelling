@@ -1,17 +1,17 @@
 """
-Evolution model (Choice A geometry, centered frame coordinates)
+Evolution Model
+- Hongze Lin
 --------------------------------------------------------------
+Basic Coordinate Assumptions
 Camera optical axis: +y
 Sensor / pixel plane: x–z
 Frame origin: (x=0, z=0) at the CENTER of the frame.
 
-State variables (same notation as simulate_forward / pipeline_forward):
+Variable Statement (same notation as simulate_forward / pipeline_forward):
   xp: particle x positions (width; out-of-paper direction), centered: [-Lx/2, Lx/2)
   zp: particle z positions (height), typically centered if zmin=-zmax
   y : particle y positions (depth/camera axis; used for sheet gating)
   c : dye concentration slice on x–z grid, shape (H, W)
-
-This file implements ONLY evolution (no rendering/camera).
 """
 
 import numpy as np
@@ -21,7 +21,7 @@ import argparse
 
 
 # =========================================================
-# Config / State (keep names consistent)
+# Config / Variable Statement
 # =========================================================
 
 @dataclass
