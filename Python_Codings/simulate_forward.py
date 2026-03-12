@@ -249,6 +249,11 @@ class SimConfig:
     auto_exposure: bool = True
     exposure_percentile: float = 99.7
 
+    # optional minimal display mode: keep only one pixel value per frame
+    minimize_to_single_pixel: bool = False
+    single_pixel_x: int = -1  # -1 -> center pixel in x
+    single_pixel_z: int = -1  # -1 -> center pixel in z
+
     seed: int = 1
 
 
@@ -530,6 +535,21 @@ def encode_frame(I,cfg):
     return auto_exposure_to_uint8(I,cfg)
 
 
+def keep_single_pixel(frame,cfg):
+
+    if not cfg.minimize_to_single_pixel:
+        return frame
+
+    ix = cfg.single_pixel_x if cfg.single_pixel_x >= 0 else (cfg.W // 2)
+    iz = cfg.single_pixel_z if cfg.single_pixel_z >= 0 else (cfg.H // 2)
+    ix = int(np.clip(ix,0,cfg.W-1))
+    iz = int(np.clip(iz,0,cfg.H-1))
+
+    out = np.zeros_like(frame)
+    out[iz,ix] = frame[iz,ix]
+    return out
+
+
 # =========================================================
 # Initialization
 # =========================================================
@@ -603,6 +623,7 @@ def forward_simulator(cfg):
         I = render_total_intensity(state,vis,xs,zs,cfg)
 
         frame = encode_frame(I,cfg)
+        frame = keep_single_pixel(frame,cfg)
 
         video[n] = frame
 

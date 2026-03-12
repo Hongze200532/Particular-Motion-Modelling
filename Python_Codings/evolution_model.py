@@ -17,7 +17,6 @@ Variable Statement (same notation as simulate_forward / pipeline_forward):
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
-import argparse
 
 
 # =========================================================
@@ -63,6 +62,11 @@ class SimConfig:
     # y evolution (to create appear/disappear in the sheet)
     y_noise_sigma: float = 0.005
     y_kill: float = 0.06
+
+    # optional minimal display mode: keep only one pixel value per frame
+    minimize_to_single_pixel: bool = False
+    single_pixel_x: int = -1  # -1 -> center pixel in x
+    single_pixel_z: int = -1  # -1 -> center pixel in z
 
     seed: int = 1
 
@@ -313,340 +317,98 @@ def run_evolution_only(cfg: SimConfig):
 
 
 # =========================================================
-# Visualisation (optional, additive)
+# Visualisation / Export (2D only, aligned with simulate_forward.py style)
 # =========================================================
 
-def _state_to_rgb_frame(state: State, xs, zs, vis, step_idx, cfg: SimConfig):
+def _state_to_uint8_frame(state: State, vis, cfg: SimConfig):
     """
-    Render one RGB frame for visualisation:
-      - background: dye field c(x,z)
-      - foreground: particles (visible vs hidden by y gating)
+    Convert latent state to one grayscale uint8 frame.
+    - base layer: concentration field c(x,z)
+    - particle layer: visible particles splatted as bright impulses
+    - per-frame percentile exposure mapping
     """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise ImportError(
-            "matplotlib is required for visualisation. "
-            "Install it first (e.g. `pip install matplotlib`)."
-        ) from exc
+    img = state.c.astype(np.float32).copy()
 
-    dx = xs[1] - xs[0]
-    x_right = xs[-1] + dx
+    px = (state.xp[vis] + 0.5 * cfg.Lx) / cfg.Lx * (cfg.W - 1)
+    pz = (state.zp[vis] - cfg.zmin) / (cfg.zmax - cfg.zmin) * (cfg.H - 1)
+    ix = np.rint(px).astype(int)
+    iz = np.rint(pz).astype(int)
+    m = (ix >= 0) & (ix < cfg.W) & (iz >= 0) & (iz < cfg.H)
+    np.add.at(img, (iz[m], ix[m]), 1.0)
 
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=120)
-    ax.imshow(
-        state.c,
-        extent=[xs[0], x_right, zs[0], zs[-1]],
-        origin="lower",
-        cmap="viridis",
-        aspect="auto",
+    hi = np.percentile(img, 99.7)
+    hi = max(hi, 1e-6)
+    frame = np.clip(img / hi * 255.0, 0, 255).astype(np.uint8)
+    return keep_single_pixel(frame, cfg)
+
+
+def keep_single_pixel(frame, cfg):
+    if not cfg.minimize_to_single_pixel:
+        return frame
+
+    ix = cfg.single_pixel_x if cfg.single_pixel_x >= 0 else (cfg.W // 2)
+    iz = cfg.single_pixel_z if cfg.single_pixel_z >= 0 else (cfg.H // 2)
+    ix = int(np.clip(ix, 0, cfg.W - 1))
+    iz = int(np.clip(iz, 0, cfg.H - 1))
+
+    out = np.zeros_like(frame)
+    out[iz, ix] = frame[iz, ix]
+    return out
+
+
+def init_diagnostics():
+    return dict(
+        c_min=[],
+        c_max=[],
+        c_mean=[],
+        visible_frac=[],
     )
 
-    hidden = ~vis
-    if np.any(hidden):
-        ax.scatter(
-            state.xp[hidden],
-            state.zp[hidden],
-            s=7,
-            c="white",
-            alpha=0.28,
-            linewidths=0.0,
-        )
-    if np.any(vis):
-        ax.scatter(
-            state.xp[vis],
-            state.zp[vis],
-            s=10,
-            c="red",
-            alpha=0.78,
-            linewidths=0.0,
-        )
 
-    ax.set_xlim(xs[0], x_right)
-    ax.set_ylim(zs[0], zs[-1])
-    ax.set_title(f"Evolution step={step_idx}, visible={np.mean(vis):.3f}")
-    ax.set_xlabel("x (width)")
-    ax.set_ylabel("z (height)")
-    fig.tight_layout()
-
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    frame = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[..., :3]
-    plt.close(fig)
-    return frame
+def append_diagnostics(diag, c, vis):
+    diag["c_min"].append(float(c.min()))
+    diag["c_max"].append(float(c.max()))
+    diag["c_mean"].append(float(c.mean()))
+    diag["visible_frac"].append(float(np.mean(vis)))
 
 
-def _state_to_rgb_frame_3d(state: State, xs, zs, vis, step_idx, cfg: SimConfig):
-    """
-    Render one 3D RGB frame:
-      - dye rendered as a thin 3D volume (stacked y-slices)
-      - particles rendered at true (x,y,z) coordinates
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise ImportError(
-            "matplotlib is required for 3D visualisation. "
-            "Install it first (e.g. `pip install matplotlib`)."
-        ) from exc
-
-    fig = plt.figure(figsize=(7.4, 6.2), dpi=120)
-    ax = fig.add_subplot(111, projection="3d")
-
-    # Downsample dye grid for faster 3D rendering.
-    x_stride = max(1, cfg.W // 96)
-    z_stride = max(1, cfg.H // 96)
-    xs_d = xs[::x_stride]
-    zs_d = zs[::z_stride]
-    c_d = state.c[::z_stride, ::x_stride]
-    Xd, Zd = np.meshgrid(xs_d, zs_d)
-
-    c_norm = c_d - np.min(c_d)
-    denom = np.max(c_norm)
-    if denom > 0:
-        c_norm = c_norm / denom
-    else:
-        c_norm = np.zeros_like(c_norm)
-
-    # Volumetric dye effect: stack multiple semi-transparent slices along y.
-    # Slices farther from sheet center are dimmer to emulate thickness falloff.
-    y_pad = max(cfg.y_kill * 2.6, cfg.sheet_thickness * 8.0)
-    dye_half_thickness = max(cfg.sheet_thickness * 2.2, 1e-4)
-    n_slices = 11
-    y_offsets = np.linspace(-dye_half_thickness, dye_half_thickness, n_slices)
-    for y_off in y_offsets:
-        y_level = cfg.sheet_center_y + y_off
-        falloff = np.exp(-0.5 * (y_off / (0.45 * dye_half_thickness)) ** 2)
-        rgba = plt.cm.viridis(c_norm)
-        rgba[..., 3] = np.clip(0.015 + 0.20 * falloff * c_norm, 0.0, 0.35)
-        Yd = np.full_like(Xd, y_level, dtype=np.float32)
-        ax.plot_surface(
-            Xd,
-            Yd,
-            Zd,
-            facecolors=rgba,
-            rstride=1,
-            cstride=1,
-            shade=False,
-            linewidth=0.0,
-            antialiased=False,
-        )
-
-    # Draw light-sheet center and boundaries in 3D for spatial context.
-    x_line = np.array([xs[0], xs[-1] + (xs[1] - xs[0])], dtype=np.float32)
-    z_line = np.array([cfg.zmin, cfg.zmax], dtype=np.float32)
-    Xl, Zl = np.meshgrid(x_line, z_line)
-    for y_plane, a in [
-        (cfg.sheet_center_y, 0.30),
-        (cfg.sheet_center_y - 0.5 * cfg.sheet_thickness, 0.18),
-        (cfg.sheet_center_y + 0.5 * cfg.sheet_thickness, 0.18),
-    ]:
-        Yl = np.full_like(Xl, y_plane, dtype=np.float32)
-        ax.plot_wireframe(Xl, Yl, Zl, color="white", linewidth=0.6, alpha=a)
-
-    hidden = ~vis
-    if np.any(hidden):
-        hidden_dist = np.abs(state.y[hidden] - cfg.sheet_center_y)
-        ax.scatter(
-            state.xp[hidden],
-            state.y[hidden],
-            state.zp[hidden],
-            s=14,
-            c=hidden_dist,
-            cmap="magma",
-            vmin=0.0,
-            vmax=y_pad,
-            marker="o",
-            alpha=0.88,
-            depthshade=True,
-        )
-    if np.any(vis):
-        ax.scatter(
-            state.xp[vis],
-            state.y[vis],
-            state.zp[vis],
-            s=16,
-            c="#00E676",
-            alpha=0.95,
-            depthshade=True,
-        )
-
-    ax.set_xlim(-0.5 * cfg.Lx, 0.5 * cfg.Lx)
-    ax.set_ylim(cfg.sheet_center_y - y_pad, cfg.sheet_center_y + y_pad)
-    ax.set_zlim(cfg.zmin, cfg.zmax)
-    # Stretch y display scale so particles are not visually collapsed.
-    y_display_stretch = 5.5
-    ax.set_box_aspect((cfg.Lx, y_display_stretch * (2.0 * y_pad), cfg.zmax - cfg.zmin))
-    ax.set_xlabel("x (width)")
-    ax.set_ylabel("y (depth)")
-    ax.set_zlabel("z (height)")
-    ax.set_title(f"3D evolution step={step_idx}, visible={np.mean(vis):.3f}")
-
-    # Keep camera fixed so key frames share identical orientation/perspective.
-    ax.set_proj_type("persp")
-    ax.view_init(elev=22, azim=38)
-    fig.tight_layout()
-
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    frame = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[..., :3]
-    plt.close(fig)
-    return frame
-
-
-def visualise_evolution(cfg: SimConfig, out_dir: Path, fps: int = 12, sample_every: int = 1):
-    """
-    Run evolution and export:
-      - evolution.gif
-      - first/middle/last key frames (PNG)
-    """
-    if sample_every <= 0:
-        raise ValueError("sample_every must be >= 1")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
+def forward_evolution_simulator(cfg: SimConfig):
     state, xs, zs = init_state(cfg)
-    t = 0.0
-    visible_frac = []
-    frames = []
 
-    for step_idx in range(cfg.T):
+    video = np.zeros((cfg.T, cfg.H, cfg.W), dtype=np.uint8)
+    diag = init_diagnostics()
+    t = 0.0
+
+    for n in range(cfg.T):
         state, vis = step_evolution(state, xs, zs, t, cfg)
-        visible_frac.append(float(np.mean(vis)))
+        video[n] = _state_to_uint8_frame(state, vis, cfg)
+        append_diagnostics(diag, state.c, vis)
         t += cfg.dt
 
-        if step_idx % sample_every == 0:
-            frames.append(_state_to_rgb_frame(state, xs, zs, vis, step_idx, cfg))
-
-    if not frames:
-        raise RuntimeError("No frames were generated. Check T/sample_every settings.")
-
-    import imageio.v2 as imageio
-    from PIL import Image
-
-    gif_path = out_dir / "evolution.gif"
-    imageio.mimsave(str(gif_path), frames, duration=1.0 / fps)
-
-    key_idxs = [0, len(frames) // 2, len(frames) - 1]
-    key_names = ["frame0", "frame_mid", "frame_last"]
-    for idx, name in zip(key_idxs, key_names):
-        Image.fromarray(frames[idx]).save(out_dir / f"{name}.png")
-
-    return {
-        "gif_path": gif_path,
-        "avg_visible_frac": float(np.mean(visible_frac)),
-        "num_frames": len(frames),
-    }
+    return video, state, diag
 
 
-def visualise_evolution_3d(cfg: SimConfig, out_dir: Path, fps: int = 12, sample_every: int = 1):
-    """
-    Run evolution and export 3D animation:
-      - evolution_3d.gif
-      - first/middle/last key frames (PNG)
-    """
-    if sample_every <= 0:
-        raise ValueError("sample_every must be >= 1")
-
+def export_video(video, out_dir, fps=20, base="evolution"):
     out_dir.mkdir(parents=True, exist_ok=True)
-    state, xs, zs = init_state(cfg)
-    t = 0.0
-    visible_frac = []
-    frames = []
-
-    for step_idx in range(cfg.T):
-        state, vis = step_evolution(state, xs, zs, t, cfg)
-        visible_frac.append(float(np.mean(vis)))
-        t += cfg.dt
-
-        if step_idx % sample_every == 0:
-            frames.append(_state_to_rgb_frame_3d(state, xs, zs, vis, step_idx, cfg))
-
-    if not frames:
-        raise RuntimeError("No 3D frames were generated. Check T/sample_every settings.")
 
     import imageio.v2 as imageio
-    from PIL import Image
 
-    gif_path = out_dir / "evolution_3d.gif"
-    imageio.mimsave(str(gif_path), frames, duration=1.0 / fps)
-
-    key_idxs = [0, len(frames) // 2, len(frames) - 1]
-    key_names = ["frame3d_0", "frame3d_mid", "frame3d_last"]
-    for idx, name in zip(key_idxs, key_names):
-        Image.fromarray(frames[idx]).save(out_dir / f"{name}.png")
-
-    return {
-        "gif_path": gif_path,
-        "avg_visible_frac": float(np.mean(visible_frac)),
-        "num_frames": len(frames),
-    }
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evolution-only model runner")
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Export visualisation GIF + key frames.",
+    imageio.mimsave(
+        str(out_dir / f"{base}.gif"),
+        video,
+        duration=1.0 / fps
     )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="Outputs_evolution",
-        help="Output directory for visualisation files (relative to script dir if not absolute).",
-    )
-    parser.add_argument("--fps", type=int, default=12, help="GIF fps for visualisation.")
-    parser.add_argument(
-        "--sample_every",
-        type=int,
-        default=1,
-        help="Render every N simulation steps.",
-    )
-    parser.add_argument(
-        "--visualize_3d",
-        action="store_true",
-        help="Export 3D visualisation GIF + key frames.",
-    )
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
     cfg = SimConfig()
-    final_state, diag = run_evolution_only(cfg)
-    print("Evolution-only run complete.")
-    print("visible fraction (avg):", float(np.mean(diag["visible_frac"])))
 
-    if args.visualize:
-        script_dir = Path(__file__).resolve().parent
-        out_dir = Path(args.out_dir)
-        if not out_dir.is_absolute():
-            out_dir = script_dir / out_dir
+    video, state, diag = forward_evolution_simulator(cfg)
 
-        result = visualise_evolution(
-            cfg=cfg,
-            out_dir=out_dir,
-            fps=args.fps,
-            sample_every=args.sample_every,
-        )
-        print("visualisation saved to:", result["gif_path"])
-        print("rendered frames:", result["num_frames"])
+    script_dir = Path(__file__).resolve().parent
+    out_dir = script_dir / "Outputs_evolution"
+    export_video(video, out_dir)
 
-    if args.visualize_3d:
-        script_dir = Path(__file__).resolve().parent
-        out_dir = Path(args.out_dir)
-        if not out_dir.is_absolute():
-            out_dir = script_dir / out_dir
-
-        result3d = visualise_evolution_3d(
-            cfg=cfg,
-            out_dir=out_dir,
-            fps=args.fps,
-            sample_every=args.sample_every,
-        )
-        print("3D visualisation saved to:", result3d["gif_path"])
-        print("3D rendered frames:", result3d["num_frames"])
+    print("video shape:", video.shape)
+    print("visible fraction:", np.mean(diag["visible_frac"]))
+    print("saved to:", out_dir)
