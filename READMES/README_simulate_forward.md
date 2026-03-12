@@ -1,418 +1,266 @@
-# Forward Flow-Dye Simulator (`simulate_forward.py`) — Detailed README
+# Forward Flow-Dye Simulator Code Guide (`simulate_forward.py`) 
 
-## 1. What This Script Does
+## 1. Purpose
 
-`simulate_forward.py` implements a **forward simulator** that generates a synthetic grayscale video from a simplified flow field model and a dye field transport model.
+`simulate_forward.py` implements a complete synthetic forward pipeline:
 
-In short, for each time step, it:
+`Evolution Model -> Optical Model -> Camera Model -> Export`
 
-1. Advances particle positions in a 2D domain.
-2. Advects a continuous dye concentration field.
-3. Optionally simulates out-of-plane particle visibility loss/respawn.
-4. Renders particle intensity + dye intensity to an image.
-5. Converts the intensity image to `uint8` frame values.
-6. Stores diagnostics and exports outputs (PNG/GIF/MP4).
+It evolves a latent physical state (particles + dye), renders intensity on an `x-z` image plane, converts that intensity into `uint8` camera-like frames, and saves a GIF.
 
-The script is self-contained and intended for simulation/prototyping workflows where you need synthetic flow videos.
+The frame origin is centered in the `x-z` plane.
 
----
+## 2. Core Data Structures
 
-## 2. High-Level Mathematical Model
+### 2.1 `SimConfig`
 
-The simulator uses a velocity field `(u, w)` in `(x, z)` coordinates:
+`SimConfig` is the single parameter container. Main groups:
 
-- `x`: horizontal coordinate (periodic boundary)
-- `z`: vertical coordinate (clamped between `zmin` and `zmax`)
+- Time / size: `T`, `dt`, `H`, `W`, `N`
+- Physical domain: `Lx`, `zmin`, `zmax`
+- Velocity field: `A`, `k`, `gamma`
+- Stochastic transport: `particle_noise_sigma`, `dye_kappa`
+- Out-of-plane and sheet gating:
+  - `enable_out_of_plane` (backward-compatibility switch)
+  - `enable_sheet_gating`
+  - `sheet_center_y`, `sheet_thickness`
+  - `y_noise_sigma`, `y_kill`
+- Optical rendering: `psf_sigma_px`, `particle_amp`, `dye_beta`, `dye_alpha`, `light_source_x_frac`, `light_source_z_above_frac`, `dye_blur_sigma_px`
+- Camera / exposure: `use_camera_model`, `bg`, `gain`, `read_sigma`, `auto_exposure`, `exposure_percentile`
+- Reproducibility: `seed`
 
-Velocity is defined from a decaying oscillatory mode:
+### 2.2 `State`
 
-- `u = Re(i k A exp(-k|z|) exp(i k x) exp(gamma t))`
-- `w = Re(-k A sign(z) exp(-k|z|) exp(i k x) exp(gamma t))`
+`State` stores the evolving latent variables:
 
-where:
+- `xp`: particle x-coordinate array `(N,)`
+- `zp`: particle z-coordinate array `(N,)`
+- `y`: particle depth coordinate `(N,)`
+- `c`: dye concentration field `(H, W)`
 
-- `A` controls amplitude
-- `k` is wave number
-- `gamma` is temporal growth/decay
+## 3. Coordinate and Boundary Conventions
 
-Particles are advanced with **RK2 (midpoint)** integration.
-The dye field is advanced with **semi-Lagrangian backtracing** + optional diffusion.
+- `x`: periodic centered interval `[-Lx/2, Lx/2)`
+- `z`: bounded interval `[zmin, zmax]`
+- `y`: depth/camera axis, used for visibility gating
 
----
+Helper `wrap_x_centered` enforces periodic `x` and is reused by particle and dye transport.
 
-## 3. File Structure (Inside `simulate_forward.py`)
+## 4. Evolution Model (Section-by-Section)
 
-The code is organized into these sections:
+### 4.1 Velocity field: `vel_u_w`
 
-1. **Config / State**
-   - `SimConfig`: all simulation/render/camera parameters.
-   - `State`: particle coordinates and dye field at current time.
+`vel_u_w(x, z, t, A, k, gamma)` returns velocity `(u, w)` on the `x-z` plane. The field is built from an analytic decaying mode:
 
-2. **Velocity field**
-   - `vel_u_w(...)`: computes flow velocity.
+- decay with height: `exp(-k|z|)`
+- oscillation in `x`: `exp(i k x)`
+- optional growth/decay in time: `exp(gamma t)`
 
-3. **Dynamics**
-   - `advect_particles_rk2(...)`
-   - `bilinear_sample(...)`
-   - `advect_dye_semilag(...)`
-   - out-of-plane helpers: `update_out_of_plane`, `visible_mask`, `respawn`
+This is the shared flow model for both particle advection and dye advection.
 
-4. **Rendering**
-   - `gaussian_blur_fft(...)`
-   - `render_particles(...)`
-   - `render_dye(...)`
+### 4.2 Particle advection: `advect_particles_rk2`
 
-5. **Camera / Exposure**
-   - `camera_model(...)`
-   - `auto_exposure_to_uint8(...)`
+Particles are advanced by RK2 (midpoint method):
 
-6. **Initialization**
-   - `init_state(...)`
+1. evaluate velocity at current position
+2. predict midpoint
+3. evaluate midpoint velocity
+4. advance full step
 
-7. **Forward simulator orchestration**
-   - internal modular steps:
-     - `init_diagnostics(...)`
-     - `step_flow_dynamics(...)`
-     - `step_out_of_plane_and_visibility(...)`
-     - `render_total_intensity(...)`
-     - `encode_frame(...)`
-     - `append_diagnostics(...)`
-   - main loop: `forward_simulator(...)`
+Then:
 
-8. **Export and CLI**
-   - `export_video(...)`
-   - `parse_cli_args(...)`
-   - `resolve_output_options(...)`
-   - `main(...)`
+- add Gaussian process noise if `particle_noise_sigma > 0`
+- wrap `x` periodically
+- clip `z` to `[zmin, zmax]`
 
----
+### 4.3 Dye advection: `advect_dye_semilag`
 
-## 4. Core Data Structures
+Dye uses semi-Lagrangian backtracing:
 
-### 4.1 `SimConfig`
+1. build grid `(X, Z)`
+2. evaluate velocity `(u, w)` on grid
+3. backtrace to `(Xb, Zb)`
+4. interpolate previous `c` at backtraced points via `bilinear_sample`
 
-`SimConfig` is the central configuration dataclass. Important groups:
+`bilinear_sample` supports periodic indexing in `x` and clamped indexing in `z`.
 
-- **Temporal and resolution**
-  - `T`: number of frames
-  - `dt`: time step
-  - `H`, `W`: frame size
-  - `N`: number of particles
+If `dye_kappa > 0`, an explicit diffusion term is added via a finite-difference Laplacian:
 
-- **Domain**
-  - `Lx`: domain width in `x`
-  - `zmin`, `zmax`: domain bounds in `z`
+- periodic neighbors in `x` (`np.roll`)
+- edge-stable handling in `z` (`np.pad(..., mode="edge")`)
+- clamp to nonnegative concentration
 
-- **Flow parameters**
-  - `A`, `k`, `gamma`
+### 4.4 Out-of-plane dynamics and visibility
 
-- **Noise and diffusion**
-  - `particle_noise_sigma`
-  - `dye_kappa`
+- `update_y_depth`: random-walk depth update
+  - `y += Normal(0, y_noise_sigma * sqrt(dt))`
+- `respawn`: re-initializes particles whose depth exceeds kill threshold
+  - kill condition in caller: `abs(y - sheet_center_y) > y_kill`
+- `visible_mask_y`: visibility test
+  - if `enable_sheet_gating=False`: all visible
+  - otherwise visible iff `abs(y - sheet_center_y) <= sheet_thickness/2`
 
-- **Out-of-plane model**
-  - `enable_out_of_plane`
-  - `sheet_thickness`
-  - `y_noise_sigma`
-  - `y_kill`
+Compatibility helpers:
 
-- **Rendering parameters**
-  - particle PSF and amplitude: `psf_sigma_px`, `particle_amp`
-  - dye lighting/attenuation: `dye_beta`, `dye_alpha`, `light_source_*`, `dye_blur_sigma_px`
+- `update_out_of_plane` is an alias wrapper around `update_y_depth`
+- `visible_mask` is an alias wrapper around `visible_mask_y`
 
-- **Camera and exposure**
-  - `use_camera_model`, `bg`, `gain`, `read_sigma`
-  - `auto_exposure`, `exposure_percentile`
+### 4.5 One-step evolution: `step_evolution`
 
-- **Randomness**
-  - `seed`
+Per step order is:
 
-### 4.2 `State`
+1. update particles (`advect_particles_rk2`)
+2. update dye (`advect_dye_semilag`)
+3. if `enable_out_of_plane=True`, update `y` and respawn killed particles
+4. compute visibility mask with `visible_mask_y`
 
-`State` stores time-varying simulation variables:
+Returns updated `(state, vis)`.
 
-- `xp`: particle `x` positions, shape `(N,)`
-- `zp`: particle `z` positions, shape `(N,)`
-- `y`: out-of-plane coordinate, shape `(N,)`
-- `c`: dye concentration field, shape `(H, W)`
+## 5. Optical Model
 
----
+### 5.1 `gaussian_blur_fft`
 
-## 5. Time-Step Pipeline in Detail
+Applies Gaussian blur in Fourier domain:
 
-At each frame index `n`:
+- FFT image
+- multiply by Gaussian kernel in frequency space
+- inverse FFT
 
-1. **Flow dynamics**
-   - Particles: RK2 advection in velocity field.
-   - Dye: semi-Lagrangian backtrace to sample previous field.
-   - Optional diffusion (discrete Laplacian + clamping to nonnegative).
+### 5.2 `render_particles`
 
-2. **Out-of-plane process** (if enabled)
-   - `y` executes stochastic motion (`Brownian-like` increment).
-   - Particles with `|y| > y_kill` are respawned in-domain.
-   - Visibility mask is determined by `|y| <= sheet_thickness/2`.
+- map physical particle coordinates to pixel indices
+- accumulate intensity impulses with `np.add.at`
+- blur by `psf_sigma_px`
 
-3. **Rendering**
-   - Particle image: splat particle impulses to nearest pixel + FFT Gaussian blur.
-   - Dye image: geometric attenuation from a light source and exponential term.
-   - Total intensity: `I = I_p + I_d`.
+Only currently visible particles are rendered (via `state.xp[vis]`, `state.zp[vis]`).
 
-4. **Frame encoding**
-   - If `use_camera_model` and auto-exposure is disabled:
-     - apply background + Poisson shot noise + Gaussian read noise.
-   - Else:
-     - percentile auto-exposure to map intensity into `[0, 255]`.
+### 5.3 `render_dye`
 
-5. **Diagnostics**
-   - Record per-frame `I_min`, `I_max`, `I_mean`, and visible fraction.
+Builds dye intensity from field `c` using a point-like light source model:
 
----
+- source position from `light_source_x_frac` and `light_source_z_above_frac`
+- distance-based attenuation `L = 1/(d^2 + eps)`
+- intensity term:
+  - `I = dye_beta * c * L * exp(-dye_alpha * d * c)`
+- optional blur `dye_blur_sigma_px`
 
-## 6. Boundary and Numerical Behavior
+### 5.4 `render_total_intensity`
 
-### 6.1 Particle boundaries
+Combines optical contributions:
 
-- `x` is periodic: `x = mod(x, Lx)`.
-- `z` is clipped: `z in [zmin, zmax]`.
+- `I_total = I_particles + I_dye`
 
-### 6.2 Dye boundaries
+## 6. Camera Model and Encoding
 
-- Semi-Lagrangian sampling uses periodicity in `x` and clamping in `z`.
-- Diffusion term uses periodic neighbors in `x` and edge padding in `z`.
+### 6.1 `camera_model`
 
-### 6.3 Interpolation
+A simple noisy sensor model:
 
-`bilinear_sample` computes four-corner interpolation weights on grid indices and supports periodic/non-periodic `x`.
+- add background (`bg`)
+- Poisson shot noise with `gain`
+- Gaussian read noise (`read_sigma`)
+- clip to `[0, 255]`, cast to `uint8`
 
----
+### 6.2 `auto_exposure_to_uint8`
 
-## 7. Initialization Details
+Percentile normalization path:
 
-`init_state(cfg)` does the following:
+- compute high percentile (`exposure_percentile`)
+- scale intensity to 8-bit range
 
-- Seeds NumPy RNG with `cfg.seed`.
-- Initializes particles:
-  - `xp ~ Uniform(0, Lx)`
-  - `zp ~ Normal(0, 0.12*(zmax-zmin))`, clipped to bounds
-- Initializes `y`:
-  - zeros if out-of-plane disabled
-  - uniform inside a central slab if enabled
-- Builds simulation grids:
-  - `xs`: evenly spaced, periodic-like (`endpoint=False`)
-  - `zs`: inclusive linear spacing in `z`
-- Initializes dye concentration with a Gaussian blob example.
+### 6.3 `encode_frame`
 
----
+Decision logic:
 
-## 8. Rendering Model Explained
+- if `use_camera_model=True` and `auto_exposure=False` -> `camera_model`
+- otherwise -> `auto_exposure_to_uint8`
 
-### 8.1 Particle rendering
+So by default (`auto_exposure=True`), auto-exposure path is used.
 
-- Convert physical positions to pixel coordinates.
-- Nearest-pixel accumulation using `np.add.at`.
-- Apply Gaussian PSF blur (`gaussian_blur_fft`).
+## 7. Initialization and Diagnostics
 
-This is computationally efficient and gives smooth bright spots from sparse particles.
+### 7.1 `init_state`
 
-### 8.2 Dye rendering
+Initializes deterministic random state from `seed`, then:
 
-For each grid point:
+- `xp`: uniform on centered interval `[-Lx/2, Lx/2)`
+- `zp`: Gaussian around 0, clipped to `[zmin, zmax]`
+- `y`: uniform around `sheet_center_y ± 0.25*sheet_thickness`
+- grid:
+  - `xs = linspace(-Lx/2, Lx/2, W, endpoint=False)`
+  - `zs = linspace(zmin, zmax, H)`
+- dye field `c`: Gaussian blob `exp(-(X^2 + (Z-0.15)^2)/0.02)`
 
-- Compute distance `d` to a virtual light source.
-- Compute attenuation-like factor `L = 1 / d^2`.
-- Intensity term: `I = dye_beta * c * L * exp(-dye_alpha * d * c)`.
-- Blur for smooth appearance.
+### 7.2 Diagnostics
 
----
+`init_diagnostics` creates lists for:
 
-## 9. Camera and Exposure
+- `I_min`, `I_max`, `I_mean`, `visible_frac`
 
-There are two frame-conversion paths:
+`append_diagnostics` appends per-frame summary values.
 
-1. **Physical-ish camera path (`camera_model`)**
-   - Adds constant background.
-   - Converts to Poisson parameter via `gain` (shot noise).
-   - Adds Gaussian read noise.
-   - Clips to `[0,255]`, casts to `uint8`.
+## 8. Main Simulation Loop
 
-2. **Auto-exposure path (`auto_exposure_to_uint8`)**
-   - Computes high percentile (`exposure_percentile`).
-   - Scales so percentile maps near 255.
-   - Useful to avoid very dark outputs.
+`forward_simulator(cfg)` performs:
 
-When `auto_exposure=True`, the script uses auto-exposure regardless of camera flag.
+1. initialize `state, xs, zs`
+2. allocate `video` array `(T, H, W)` as `uint8`
+3. for each time step:
+   - `state, vis = step_evolution(...)`
+   - `I = render_total_intensity(...)`
+   - `frame = encode_frame(I, cfg)`
+   - write frame to `video`
+   - append diagnostics
+4. return `(video, state, diag)`
 
----
+## 9. Export and Script Entry Point
 
-## 10. Outputs
+### 9.1 `export_video`
 
-### 10.1 In-memory return values
+Current export function writes only a GIF:
 
-`forward_simulator(cfg)` returns:
+- output path: `<out_dir>/<base>.gif`
+- encoder: `imageio.mimsave`
 
-- `video_u8`: NumPy array `(T, H, W)`, `uint8`
-- `final_state`: final `State`
-- `diagnostics`: dictionary with lists
+### 9.2 `main`
 
-### 10.2 Files written by CLI execution
+`main()` currently uses default config only (no argument parsing in this version):
 
-By default, output directory is:
+- runs `forward_simulator(SimConfig())`
+- saves to `<script_dir>/Outputs_simulate`
+- prints video shape, average visible fraction, and save path
 
-- `<script_dir>/Outputs_simulate`
+## 10. Call Graph
 
-Files include:
-
-- `sim_frame0.png`
-- `sim_frame_mid.png`
-- `sim_frame_last.png`
-- `sim.gif` (default unless format flags override)
-- `sim.mp4` (default unless format flags override)
-
-If MP4 writing fails, warning suggests installing `imageio-ffmpeg`.
-
----
-
-## 11. Command-Line Usage
-
-Basic run (auto-exposure enabled by default):
-
-```bash
-python simulate_forward.py
+```text
+main
+  -> forward_simulator
+       -> init_state
+       -> init_diagnostics
+       -> loop over T:
+            -> step_evolution
+                 -> advect_particles_rk2
+                      -> vel_u_w
+                 -> advect_dye_semilag
+                      -> vel_u_w
+                      -> bilinear_sample
+                 -> update_y_depth (if enable_out_of_plane)
+                 -> respawn (if enable_out_of_plane)
+                 -> visible_mask_y
+            -> render_total_intensity
+                 -> render_particles
+                      -> gaussian_blur_fft
+                 -> render_dye
+                      -> gaussian_blur_fft
+            -> encode_frame
+                 -> camera_model or auto_exposure_to_uint8
+            -> append_diagnostics
+       -> return video, state, diag
+  -> export_video
 ```
 
-Specify output directory and basename:
+## 11. Known Behavior Notes
 
-```bash
-python simulate_forward.py --out ./results --base caseA
-```
-
-Export only GIF:
-
-```bash
-python simulate_forward.py --gif
-```
-
-Export only MP4:
-
-```bash
-python simulate_forward.py --mp4
-```
-
-Disable auto exposure (use camera model if enabled):
-
-```bash
-python simulate_forward.py --no-auto-exposure
-```
-
-Set FPS for GIF/MP4:
-
-```bash
-python simulate_forward.py --fps 30
-```
-
-Format behavior rule:
-
-- If neither `--gif` nor `--mp4` is provided, both are saved.
-- If either flag is provided, only the selected formats are saved.
-
----
-
-## 12. Reproducibility Notes
-
-- Initialization uses `np.random.seed(cfg.seed)`.
-- Randomness during simulation (particle noise, out-of-plane noise, camera noise) depends on global NumPy RNG state after initialization.
-- To compare outputs exactly, keep:
-  - same NumPy version
-  - same config values
-  - same execution order
-
----
-
-## 13. Performance Considerations
-
-Main cost centers:
-
-1. `render_particles` with full-frame blur.
-2. `render_dye` with full-field evaluation + blur.
-3. Per-frame semi-Lagrangian interpolation.
-
-Ways to speed up:
-
-- Reduce `H`, `W`, `T`, or `N`.
-- Lower blur sigmas if visually acceptable.
-- Profile hot paths before introducing optimization complexity.
-
----
-
-## 14. Safe Extension Points
-
-If you want to extend behavior while preserving overall architecture:
-
-1. Replace velocity model in `vel_u_w`.
-2. Replace dye initial condition in `init_state`.
-3. Add external forcing/source terms in `step_flow_dynamics`.
-4. Modify rendering kernels in `render_particles`/`render_dye`.
-5. Add more diagnostics via `append_diagnostics`.
-
-Because the simulator is modular, these can be changed with minimal impact on CLI/export.
-
----
-
-## 15. Troubleshooting
-
-### Problem: Output looks too dark
-
-- Keep auto-exposure on (default).
-- Increase `particle_amp` or `dye_beta`.
-- Reduce `dye_alpha` if dye decays visually too fast with distance.
-
-### Problem: Motion appears weak
-
-- Increase `A` or adjust `k`.
-- Increase `T` for longer sequence.
-
-### Problem: Too many particles disappear
-
-- Increase `y_kill`.
-- Reduce `y_noise_sigma`.
-- Increase `sheet_thickness` for visibility threshold.
-
-### Problem: MP4 not written
-
-- Install `imageio-ffmpeg`.
-- GIF and PNG snapshots should still be available.
-
----
-
-## 16. Quick API Example (Programmatic Use)
-
-```python
-from simulate_forward import SimConfig, forward_simulator, export_video
-from pathlib import Path
-
-cfg = SimConfig(T=120, H=256, W=256, N=1500, seed=42)
-video, state, diag = forward_simulator(cfg)
-
-export_video(
-    video,
-    out_dir=Path("./outputs_custom"),
-    fps=24,
-    save_gif=True,
-    save_mp4=False,
-    base="experiment_01"
-)
-```
-
----
-
-## 17. Summary
-
-This simulator provides a compact but expressive synthetic video pipeline combining:
-
-- analytic flow advection,
-- particle and field representations,
-- physically inspired intensity rendering,
-- optional camera/noise model,
-- export utilities for quick visual inspection.
-
-It is suitable for data generation, inverse-problem prototyping, and algorithm testing where fully real fluid simulation is unnecessary.
+- `c` is actively evolved every step in this version (semi-Lagrangian + optional diffusion).
+- `enable_out_of_plane=False` disables `y` random walk and respawn, but visibility still follows `visible_mask_y` based on current `y` and gating settings.
+- No MP4 export path exists in this file version; export is GIF-only.
