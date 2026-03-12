@@ -194,27 +194,29 @@ import argparse
 
 
 # =========================================================
-# Config / State
+# Config / Variable Statement
 # =========================================================
 
 @dataclass
 class SimConfig:
-
+    # Time / Size
     T: int = 80
     dt: float = 0.02
-
     H: int = 384
     W: int = 384
     N: int = 1000
 
+    # Physical domain
     Lx: float = 1.0
     zmin: float = -0.5
     zmax: float = 0.5
 
+    # Placeholder velocity field on x-z slice
     A: float = 0.02
     k: float = 2*np.pi
     gamma: float = 0.0
 
+    # particle dynamics noise for x-z advection 
     particle_noise_sigma: float = 5e-4
     dye_kappa: float = 0.0
 
@@ -260,11 +262,16 @@ class State:
 # Evolution Model
 # =========================================================
 
+'''
+Coordinate helpers (NEW): centered periodic wrap in x
+'''
 def wrap_x_centered(x, Lx):
 
     return ((x + 0.5*Lx) % Lx) - 0.5*Lx
 
-
+'''
+Velocity field on x–z slice
+'''
 def vel_u_w(x, z, t, A, k, gamma):
 
     decay = np.exp(-k*np.abs(z))
@@ -276,7 +283,9 @@ def vel_u_w(x, z, t, A, k, gamma):
 
     return u, w
 
-
+'''
+Numercial advection and evolution steps
+'''
 def advect_particles_rk2(x, z, t, dt, cfg):
 
     u1,w1 = vel_u_w(x,z,t,cfg.A,cfg.k,cfg.gamma)
